@@ -1,0 +1,2122 @@
+// =============================================================================
+// EXIM ERP — Prisma schema (MySQL 8)
+// Domains: core · reference · sourcing · warehouse · compliance · logistics
+//          · customs · finance · audit
+//
+// Conventions
+//   • Masters/documents: Int autoincrement PK. High-volume append-only logs: BigInt PK.
+//   • Money: Decimal(18,2) amounts · Decimal(18,4) unit prices/costs · Decimal(18,6) FX
+//   • Quantity Decimal(18,3) · Weight Decimal(14,3) · Rates (percent) Decimal(7,4)
+//   • Currency columns are CHAR(3) ISO-4217 and FK -> Currency.code (types must match for MySQL FKs)
+//   • *Event / *History / AuditLog tables are APPEND-ONLY (never UPDATE/DELETE from app code)
+//   • Functional (base) currency is INR; *Inr columns are always INR.
+//   • Shipment.version is an optimistic-lock counter; always update via updateMany({ where: { id, version } })
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+enum UserRole {
+  ADMIN
+  SOURCING_MANAGER
+  WAREHOUSE_MANAGER
+  LOGISTICS_MANAGER
+  COMPLIANCE_OFFICER
+  FINANCE_CONTROLLER
+  VIEWER
+}
+
+enum AeoTier {
+  NONE
+  T1
+  T2
+  T3
+  LO
+}
+
+enum LutStatus {
+  ACTIVE
+  EXPIRED
+  REVOKED
+}
+
+enum PartyType {
+  BUYER
+  CONSIGNEE
+  NOTIFY_PARTY
+  FREIGHT_FORWARDER
+  CUSTOMS_HOUSE_AGENT
+  SHIPPING_LINE
+  AIRLINE
+  CFS_OPERATOR
+  OTHER
+}
+
+enum LocationType {
+  SEA_PORT
+  AIRPORT
+  ICD
+  CFS
+  INLAND_PORT
+}
+
+enum FxRateSource {
+  RBI_REFERENCE
+  CUSTOMS_NOTIFIED
+  BANK
+  MANUAL
+}
+
+enum FxSide {
+  BUY_FOREIGN
+  SELL_FOREIGN
+}
+
+enum VendorStatus {
+  PROSPECT
+  ONBOARDING
+  VERIFIED
+  SUSPENDED
+  BLACKLISTED
+}
+
+enum AuditStandard {
+  SEDEX_SMETA
+  BSCI
+  WRAP
+  ISO_9001
+  OTHER
+}
+
+enum AuditResult {
+  PASSED
+  PASSED_WITH_MINOR_NC
+  FAILED
+  PENDING
+}
+
+enum Incoterm {
+  EXW
+  FCA
+  FAS
+  FOB
+  CFR
+  CIF
+  CPT
+  CIP
+  DAP
+  DPU
+  DDP
+}
+
+enum PoStatus {
+  DRAFT
+  ISSUED
+  AWAITING_PRODUCTION
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CLOSED
+  CANCELLED
+}
+
+enum ForwardContractStatus {
+  OPEN
+  PARTIALLY_UTILIZED
+  UTILIZED
+  CANCELLED
+  EXPIRED
+}
+
+enum WarehouseType {
+  AMBIENT
+  COLD_STORAGE
+  BONDED
+  CFS
+}
+
+enum GrnStatus {
+  OPEN
+  INSPECTING
+  COMPLETED
+  REJECTED
+}
+
+enum InspectionResult {
+  PENDING
+  PASSED
+  PASSED_WITH_DEVIATION
+  FAILED
+}
+
+enum GradeTier {
+  PREMIUM
+  A
+  B
+  C
+  REJECT
+  UNGRADED
+}
+
+enum BatchStatus {
+  RECEIVED_UNSORTED
+  QUARANTINE
+  AVAILABLE
+  RESERVED
+  PACKED
+  DISPATCHED
+  ON_HOLD
+  CONSUMED
+}
+
+enum TagType {
+  BARCODE_CODE128
+  GS1_128
+  QR
+  RFID_EPC
+}
+
+enum TagStatus {
+  ACTIVE
+  VOID
+  LOST
+}
+
+enum PackagingType {
+  CARTON
+  WOODEN_PALLET
+  WOODEN_CRATE
+  DRUM
+  BAG
+  BULK
+}
+
+enum Ispm15Treatment {
+  NOT_APPLICABLE
+  HT
+  MB
+  DH
+  SF
+}
+
+enum LabProvider {
+  SGS
+  BUREAU_VERITAS
+  INTERTEK
+  TUV
+  NABL_OTHER
+}
+
+enum LabTestStatus {
+  SAMPLE_DISPATCHED
+  IN_PROGRESS
+  PASSED
+  FAILED
+  RETEST_REQUIRED
+}
+
+enum ValidationStatus {
+  PENDING
+  PASSED
+  FAILED
+}
+
+enum TradeDirection {
+  EXPORT
+  IMPORT
+}
+
+enum TransportMode {
+  SEA
+  AIR
+}
+
+enum ShipmentStatus {
+  DRAFT
+  PLANNED
+  BOOKED
+  GATED_IN
+  AT_PORT
+  CUSTOMS_EXPORT_PROCESSING
+  EXPORT_LEO_GRANTED
+  CUSTOMS_HOLD
+  LOADED
+  IN_TRANSIT
+  ARRIVED_DESTINATION
+  CUSTOMS_IMPORT_HOLD
+  CUSTOMS_RELEASED
+  DELIVERED
+  CLOSED
+  CANCELLED
+}
+
+// Granular, append-only position milestones. Shipment/Batch carry the latest value (denormalised).
+enum TrackingMilestone {
+  // sourcing & warehouse
+  PO_ISSUED
+  GOODS_INWARDED
+  INWARD_INSPECTION_PASSED
+  GRADED
+  BATCH_CREATED
+  TAGGED
+  PACKED
+  LAB_SAMPLE_DISPATCHED
+  LAB_CLEARED
+  LABEL_VALIDATED
+  READY_FOR_DISPATCH
+  // sea
+  CONTAINER_BOOKED
+  CARTING_ORDER_ISSUED
+  CARTED_TO_PORT
+  GATE_IN_PORT
+  PORT_YARD_STACKED
+  PORT_STOCKED_REEFER
+  DISCHARGED_SEA_YARD
+  LOADED_ON_VESSEL
+  VESSEL_DEPARTED
+  // air
+  COLD_CHAIN_GATE_IN
+  AIR_CARGO_GATE_IN
+  IN_TRANSIT_TARMAC
+  LOADED_ON_AIRCRAFT
+  FLIGHT_DEPARTED
+  // customs & PGA
+  SHIPPING_BILL_FILED
+  LEO_GRANTED
+  MANIFEST_FILED
+  CUSTOMS_HOLD_PLACED
+  PGA_CLEARANCE_PENDING
+  PGA_CLEARED
+  CUSTOMS_HOLD_RELEASED
+  OOC_GRANTED
+  LAST_MILE_DELIVERY
+  POD_SIGNED
+  // end of journey
+  ARRIVED_DESTINATION
+  DELIVERED
+  EXCEPTION_RAISED
+}
+
+enum TrackingSource {
+  MANUAL
+  RFID_SCAN
+  BARCODE_SCAN
+  API
+  EDI
+  SYSTEM
+}
+
+enum ContainerLoadType {
+  FCL
+  LCL
+}
+
+enum ContainerType {
+  GP_20
+  GP_40
+  HC_40
+  REEFER_20
+  REEFER_40
+  OPEN_TOP_20
+  OPEN_TOP_40
+  FLAT_RACK_20
+  FLAT_RACK_40
+  ISO_TANK
+}
+
+enum YardStackingType {
+  STANDARD
+  REEFER_PLUGGED
+  HAZARDOUS
+  OVER_DIMENSIONAL
+  EMPTY_STACK
+}
+
+enum TemperatureZone {
+  AMBIENT
+  CRT
+  COLD
+  FROZEN
+}
+
+enum IataHandlingCode {
+  PER
+  PIL
+  PEM
+  PEF
+  PEP
+  PES
+  COL
+  ACT
+  DGR
+  VAL
+  HUM
+  AVI
+  ICE
+}
+
+enum ShippingBillStatus {
+  DRAFT
+  FILED
+  ASSESSED
+  LEO_GRANTED
+  AMENDED
+  CANCELLED
+}
+
+enum IgstPaymentMode {
+  LUT_ZERO_RATED
+  PAID_WITH_REFUND_CLAIM
+  NOT_APPLICABLE
+}
+
+enum ManifestType {
+  IGM
+  EGM
+  ISF
+  ENS
+}
+
+enum ManifestStatus {
+  DRAFT
+  FILED
+  ACCEPTED
+  REJECTED
+  AMENDED
+}
+
+enum BoeStatus {
+  DRAFT
+  FILED
+  ASSESSED
+  DUTY_PAID
+  OOC_GRANTED
+  QUERY_RAISED
+  CANCELLED
+}
+
+enum CustomsHoldReason {
+  ASSESSMENT_PENDING
+  PGA_PENDING
+  DOCUMENT_DISCREPANCY
+  PHYSICAL_EXAMINATION
+  VALUATION_QUERY
+  RISK_PROFILING
+  SAMPLE_TESTING
+}
+
+enum HoldStatus {
+  ACTIVE
+  ESCALATED
+  RELEASED
+}
+
+enum ClearanceBoard {
+  FSSAI
+  BIS
+  CDSCO
+  PLANT_QUARANTINE
+  ANIMAL_QUARANTINE
+  APEDA
+  MPEDA
+  EIC
+  WILDLIFE
+  OTHER
+}
+
+enum ClearanceStatus {
+  NOT_REQUIRED
+  REQUIRED
+  SUBMITTED
+  UNDER_REVIEW
+  QUERY_RAISED
+  SAMPLE_DRAWN
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+enum RuleScope {
+  EXPORT
+  IMPORT
+  BOTH
+}
+
+enum ComplianceEventType {
+  REQUIREMENT_TRIGGERED
+  SUBMITTED
+  QUERY_RAISED
+  SAMPLE_DRAWN
+  APPROVED
+  REJECTED
+  WAIVED
+}
+
+enum IncentiveScheme {
+  RODTEP
+  DUTY_DRAWBACK
+  ROSCTL
+  ADVANCE_AUTHORISATION
+  EPCG
+}
+
+enum IncentiveStatus {
+  ELIGIBLE
+  CLAIMED
+  SCROLL_GENERATED
+  CREDITED
+  REJECTED
+}
+
+enum LandedCostComponent {
+  PRODUCT_COST
+  FREIGHT
+  INSURANCE
+  BASIC_CUSTOMS_DUTY
+  SOCIAL_WELFARE_SURCHARGE
+  ADDITIONAL_DUTY
+  IGST
+  PORT_HANDLING
+  TERMINAL_HANDLING
+  CFS_CHARGES
+  CUSTOMS_BROKERAGE
+  INLAND_TRANSPORT
+  BANK_CHARGES
+  DEMURRAGE
+  DETENTION
+  OTHER
+}
+
+enum AllocationBasis {
+  VALUE
+  WEIGHT
+  QUANTITY
+}
+
+enum LandedCostStatus {
+  ESTIMATED
+  PROVISIONAL
+  FINAL
+  SUPERSEDED
+}
+
+enum LcType {
+  SIGHT
+  USANCE
+  REVOLVING
+  STANDBY
+  TRANSFERABLE
+}
+
+enum LcStatus {
+  OPENED
+  ADVISED
+  AMENDED
+  DOCS_PRESENTED
+  ACCEPTED
+  PAID
+  EXPIRED
+  CANCELLED
+}
+
+enum LcMilestoneType {
+  LC_ADVISED
+  LC_AMENDED
+  LATEST_SHIPMENT_DATE
+  DOCS_PRESENTATION_DUE
+  DOCS_PRESENTED
+  DISCREPANCY_RAISED
+  DOCS_ACCEPTED
+  PAYMENT_DUE
+  PAYMENT_RECEIVED
+  LC_EXPIRY
+}
+
+enum MilestoneStatus {
+  PENDING
+  DONE
+  MISSED
+}
+
+enum BgType {
+  PERFORMANCE
+  ADVANCE_PAYMENT
+  BID_BOND
+  CUSTOMS_BOND
+  FINANCIAL
+}
+
+enum BgStatus {
+  ACTIVE
+  INVOKED
+  RELEASED
+  EXPIRED
+}
+
+enum InvoiceType {
+  COMMERCIAL
+  PROFORMA
+  CREDIT_NOTE
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PARTIALLY_PAID
+  SETTLED
+  CANCELLED
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  STATUS_CHANGE
+}
+
+enum MessageDirection {
+  OUTBOUND
+  INBOUND
+}
+
+// =============================================================================
+// CORE
+// =============================================================================
+
+model Company {
+  id               Int       @id @default(autoincrement())
+  legalName        String    @db.VarChar(200)
+  iec              String    @unique @db.VarChar(10)
+  iecIssuedOn      DateTime? @db.Date
+  gstin            String?   @unique @db.VarChar(15)
+  pan              String?   @db.VarChar(10)
+  adCode           String?   @db.VarChar(20)
+  aeoTier          AeoTier   @default(NONE)
+  aeoCertificateNo String?   @db.VarChar(40)
+  aeoValidTill     DateTime? @db.Date
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  users                 User[]
+  lutRegistrations      LutRegistration[]
+  vendors               Vendor[]
+  purchaseOrders        PurchaseOrder[]
+  forwardContracts      ForwardContract[]
+  warehouses            Warehouse[]
+  shipments             Shipment[]
+  letterOfCredits       LetterOfCredit[]
+  bankGuarantees        BankGuarantee[]
+  workingCapital        WorkingCapitalSnapshot[]
+  ledgerEntries         FinanceLedgerEntry[]
+  invoices              Invoice[]
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  companyId    Int?
+  email        String   @unique @db.VarChar(190)
+  name         String   @db.VarChar(120)
+  role         UserRole @default(VIEWER)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  company          Company?                @relation(fields: [companyId], references: [id])
+  inspections      Inspection[]
+  trackingEvents   ShipmentTrackingEvent[]
+  statusChanges    ShipmentStatusHistory[]
+  complianceEvents ComplianceEvent[]
+  customsHolds     CustomsHold[]
+  landedCostSheets LandedCostSheet[]
+  auditLogs        AuditLog[]
+  completedSteps   ConsignmentStep[]
+  ispm15Verifications PackagingRecord[] @relation("Ispm15Verifier")
+
+  @@index([companyId, role])
+}
+
+model LutRegistration {
+  id            Int       @id @default(autoincrement())
+  companyId     Int
+  lutNumber     String    @db.VarChar(40)
+  arn           String?   @db.VarChar(40)
+  financialYear String    @db.VarChar(9) // e.g. 2026-2027
+  validFrom     DateTime  @db.Date
+  validTill     DateTime  @db.Date
+  status        LutStatus @default(ACTIVE)
+  createdAt     DateTime  @default(now())
+
+  company  Company   @relation(fields: [companyId], references: [id])
+  invoices Invoice[]
+
+  @@unique([companyId, financialYear])
+  @@index([companyId, status, validTill])
+}
+
+// =============================================================================
+// REFERENCE DATA
+// =============================================================================
+
+model Currency {
+  code       String  @id @db.Char(3)
+  name       String  @db.VarChar(60)
+  minorUnits Int     @default(2)
+  isActive   Boolean @default(true)
+
+  ratesFrom        ExchangeRate[]    @relation("RateFrom")
+  ratesTo          ExchangeRate[]    @relation("RateTo")
+  purchaseOrders   PurchaseOrder[]
+  forwardContracts ForwardContract[]
+  shipments        Shipment[]
+  shipmentCharges  ShipmentCharge[]
+  landedCostLines  LandedCostLine[]
+  letterOfCredits  LetterOfCredit[]
+  bankGuarantees   BankGuarantee[]
+  invoices         Invoice[]
+  ledgerEntries    FinanceLedgerEntry[]
+}
+
+model ExchangeRate {
+  id            Int          @id @default(autoincrement())
+  fromCurrency  String       @db.Char(3)
+  toCurrency    String       @db.Char(3)
+  rate          Decimal      @db.Decimal(18, 6)
+  source        FxRateSource
+  effectiveDate DateTime     @db.Date
+  createdAt     DateTime     @default(now())
+
+  fromRef Currency @relation("RateFrom", fields: [fromCurrency], references: [code])
+  toRef   Currency @relation("RateTo", fields: [toCurrency], references: [code])
+
+  @@unique([fromCurrency, toCurrency, source, effectiveDate])
+  @@index([fromCurrency, toCurrency, effectiveDate])
+}
+
+model Location {
+  id          Int          @id @default(autoincrement())
+  unlocode    String       @unique @db.VarChar(5)
+  customsCode String?      @unique @db.VarChar(10) // ICEGATE port/airport code e.g. INNSA1
+  name        String       @db.VarChar(120)
+  countryCode String       @db.Char(2)
+  type        LocationType
+  isActive    Boolean      @default(true)
+
+  shipmentsLoading   Shipment[]              @relation("ShipmentPol")
+  shipmentsDischarge Shipment[]              @relation("ShipmentPod")
+  trackingEvents     ShipmentTrackingEvent[]
+  shippingBills      ShippingBill[]
+  billsOfEntry       BillOfEntry[]
+
+  @@index([countryCode, type])
+}
+
+model HsCode {
+  id          Int     @id @default(autoincrement())
+  code        String  @unique @db.VarChar(10) // 8-digit ITC-HS or 10-digit national code
+  digits      Int // 6 | 8 | 10
+  chapter     String  @db.Char(2)
+  description String  @db.VarChar(500)
+  uqc         String? @db.VarChar(10)
+  isActive    Boolean @default(true)
+
+  products        Product[]
+  dutyRates       HsDutyRate[]
+  shipmentItems   ShipmentItem[]
+  shippingBillItems ShippingBillItem[]
+  boeItems        BillOfEntryItem[]
+  invoiceLines    InvoiceLine[]
+  clearances      RegulatoryClearance[]
+
+  @@index([chapter])
+}
+
+// Duty/tax rates by importing jurisdiction. All rates are percentages.
+//   bcdRate            : basic customs duty on assessable value
+//   swsRate            : social welfare surcharge, expressed as % OF BCD (India: 10)
+//   additionalDutyRate : AIDC / anti-dumping / safeguard etc. on assessable value
+//   igstRate           : IGST / VAT / GST, levied on (AV + BCD + SWS + additional)
+model HsDutyRate {
+  id                 Int       @id @default(autoincrement())
+  hsCodeId           Int
+  countryCode        String    @db.Char(2)
+  bcdRate            Decimal   @default(0) @db.Decimal(7, 4)
+  swsRate            Decimal   @default(0) @db.Decimal(7, 4)
+  additionalDutyRate Decimal   @default(0) @db.Decimal(7, 4)
+  igstRate           Decimal   @default(0) @db.Decimal(7, 4)
+  effectiveFrom      DateTime  @db.Date
+  effectiveTo        DateTime? @db.Date
+  notificationRef    String?   @db.VarChar(120)
+
+  hsCode HsCode @relation(fields: [hsCodeId], references: [id])
+
+  @@unique([hsCodeId, countryCode, effectiveFrom])
+  @@index([hsCodeId, countryCode, effectiveFrom])
+}
+
+// Workflow trigger: any shipment line whose HS code STARTS WITH hsPrefix needs `board` clearance.
+model HsRegulatoryRule {
+  id            Int            @id @default(autoincrement())
+  hsPrefix      String         @db.VarChar(10)
+  board         ClearanceBoard
+  scope         RuleScope      @default(BOTH)
+  isMandatory   Boolean        @default(true)
+  leadTimeDays  Int?
+  description   String?        @db.VarChar(300)
+  isActive      Boolean        @default(true)
+
+  clearances RegulatoryClearance[]
+
+  @@unique([hsPrefix, board, scope])
+  @@index([hsPrefix])
+  @@index([board, isActive])
+}
+
+model Product {
+  id              Int              @id @default(autoincrement())
+  sku             String           @unique @db.VarChar(60)
+  name            String           @db.VarChar(200)
+  hsCodeId        Int
+  uom             String           @db.VarChar(10)
+  isPerishable    Boolean          @default(false)
+  defaultTempZone TemperatureZone?
+  shelfLifeDays   Int?
+  unitLandedCostInr Decimal?       @db.Decimal(18, 4) // refreshed by landed-cost consolidation at OOC
+  unitLandedCostAt  DateTime?
+  isActive        Boolean          @default(true)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  hsCode        HsCode                @relation(fields: [hsCodeId], references: [id])
+  poLines       PurchaseOrderLine[]
+  inwardLines   InwardReceiptLine[]
+  batches       Batch[]
+  shipmentItems ShipmentItem[]
+
+  @@index([hsCodeId])
+}
+
+// Buyers, consignees, forwarders, CHAs, shipping lines, airlines, CFS operators
+model Party {
+  id          Int       @id @default(autoincrement())
+  code        String    @unique @db.VarChar(40)
+  name        String    @db.VarChar(200)
+  type        PartyType
+  countryCode String    @db.Char(2)
+  taxId       String?   @db.VarChar(40)
+  email       String?   @db.VarChar(190)
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+
+  shipmentsAsBuyer     Shipment[]       @relation("ShipmentBuyer")
+  shipmentsAsConsignee Shipment[]       @relation("ShipmentConsignee")
+  shipmentsAsForwarder Shipment[]       @relation("ShipmentForwarder")
+  shipmentsAsCha       Shipment[]       @relation("ShipmentCha")
+  shipmentsAsCarrier   Shipment[]       @relation("ShipmentCarrier")
+  lcsAsApplicant       LetterOfCredit[] @relation("LcApplicant")
+  chargesPaid          ShipmentCharge[]
+
+  @@index([type, countryCode])
+}
+
+model Bank {
+  id        Int     @id @default(autoincrement())
+  name      String  @db.VarChar(160)
+  swiftCode String? @unique @db.VarChar(11)
+  ifsc      String? @db.VarChar(11)
+  adCode    String? @db.VarChar(20)
+
+  forwardContracts ForwardContract[]
+  lcsIssuing       LetterOfCredit[]  @relation("LcIssuingBank")
+  lcsAdvising      LetterOfCredit[]  @relation("LcAdvisingBank")
+  bankGuarantees   BankGuarantee[]
+}
+
+// =============================================================================
+// SOURCING
+// =============================================================================
+
+model Vendor {
+  id          Int          @id @default(autoincrement())
+  companyId   Int
+  code        String       @unique @db.VarChar(40)
+  name        String       @db.VarChar(200)
+  gstin       String?      @db.VarChar(15)
+  pan         String?      @db.VarChar(10)
+  countryCode String       @default("IN") @db.Char(2)
+  status      VendorStatus @default(PROSPECT)
+  onboardedAt DateTime?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  company         Company          @relation(fields: [companyId], references: [id])
+  audits          VendorAudit[]
+  steps           ConsignmentStep[]
+  purchaseOrders  PurchaseOrder[]
+  inwardReceipts  InwardReceipt[]
+  batches         Batch[]
+
+  @@index([companyId, status])
+}
+
+model VendorAudit {
+  id            Int           @id @default(autoincrement())
+  vendorId      Int
+  standard      AuditStandard
+  auditBody     String?       @db.VarChar(120)
+  certificateNo String?       @db.VarChar(60)
+  auditDate     DateTime      @db.Date
+  validTill     DateTime?     @db.Date
+  score         Decimal?      @db.Decimal(5, 2)
+  result        AuditResult   @default(PENDING)
+  reportUrl     String?       @db.VarChar(500)
+  createdAt     DateTime      @default(now())
+
+  vendor Vendor @relation(fields: [vendorId], references: [id])
+
+  @@index([vendorId, standard, auditDate])
+  @@index([validTill])
+}
+
+model ForwardContract {
+  id             Int                   @id @default(autoincrement())
+  companyId      Int
+  bankId         Int
+  contractNo     String                @unique @db.VarChar(40)
+  side           FxSide
+  currencyCode   String                @db.Char(3)
+  notionalAmount Decimal               @db.Decimal(18, 2)
+  utilizedAmount Decimal               @default(0) @db.Decimal(18, 2)
+  contractRate   Decimal               @db.Decimal(18, 6)
+  spotAtBooking  Decimal?              @db.Decimal(18, 6)
+  bookingDate    DateTime              @db.Date
+  windowStart    DateTime              @db.Date
+  maturityDate   DateTime              @db.Date
+  status         ForwardContractStatus @default(OPEN)
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+
+  company        Company         @relation(fields: [companyId], references: [id])
+  bank           Bank            @relation(fields: [bankId], references: [id])
+  currency       Currency        @relation(fields: [currencyCode], references: [code])
+  purchaseOrders PurchaseOrder[]
+  ledgerEntries  FinanceLedgerEntry[]
+
+  @@index([companyId, status, maturityDate])
+  @@index([bankId])
+  @@index([currencyCode])
+}
+
+model PurchaseOrder {
+  id                   Int       @id @default(autoincrement())
+  poNo                 String    @unique @db.VarChar(40)
+  companyId            Int
+  vendorId             Int
+  forwardContractId    Int?
+  incoterm             Incoterm
+  incotermPlace        String?   @db.VarChar(120)
+  currencyCode         String    @db.Char(3)
+  status               PoStatus  @default(DRAFT)
+  orderDate            DateTime  @db.Date
+  expectedDeliveryDate DateTime? @db.Date
+  totalAmount          Decimal   @default(0) @db.Decimal(18, 2)
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  company         Company             @relation(fields: [companyId], references: [id])
+  vendor          Vendor              @relation(fields: [vendorId], references: [id])
+  forwardContract ForwardContract?    @relation(fields: [forwardContractId], references: [id])
+  currency        Currency            @relation(fields: [currencyCode], references: [code])
+  lines           PurchaseOrderLine[]
+  steps           ConsignmentStep[]
+  inwardReceipts  InwardReceipt[]
+
+  @@index([companyId, status])
+  @@index([vendorId, orderDate])
+  @@index([forwardContractId])
+  @@index([currencyCode])
+}
+
+model PurchaseOrderLine {
+  id              Int     @id @default(autoincrement())
+  purchaseOrderId Int
+  lineNo          Int
+  productId       Int
+  quantity        Decimal @db.Decimal(18, 3)
+  uom             String  @db.VarChar(10)
+  unitPrice       Decimal @db.Decimal(18, 4)
+  lineTotal       Decimal @db.Decimal(18, 2)
+
+  purchaseOrder PurchaseOrder        @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  product       Product              @relation(fields: [productId], references: [id])
+  inwardLines   InwardReceiptLine[]
+
+  @@unique([purchaseOrderId, lineNo])
+  @@index([productId])
+}
+
+// =============================================================================
+// WAREHOUSE & TRACEABILITY
+// =============================================================================
+
+model Warehouse {
+  id        Int           @id @default(autoincrement())
+  companyId Int
+  code      String        @unique @db.VarChar(30)
+  name      String        @db.VarChar(160)
+  type      WarehouseType @default(AMBIENT)
+  address   String?       @db.VarChar(400)
+  isActive  Boolean       @default(true)
+
+  company        Company             @relation(fields: [companyId], references: [id])
+  locations      WarehouseLocation[]
+  inwardReceipts InwardReceipt[]
+  batches        Batch[]
+
+  @@index([companyId, type])
+}
+
+model WarehouseLocation {
+  id           Int              @id @default(autoincrement())
+  warehouseId  Int
+  code         String           @db.VarChar(30)
+  temperatureZone TemperatureZone @default(AMBIENT)
+
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id])
+  batches   Batch[]
+
+  @@unique([warehouseId, code])
+}
+
+// Goods Receipt Note
+model InwardReceipt {
+  id              Int       @id @default(autoincrement())
+  grnNo           String    @unique @db.VarChar(40)
+  warehouseId     Int
+  vendorId        Int
+  purchaseOrderId Int?
+  status          GrnStatus @default(OPEN)
+  receivedAt      DateTime
+  vehicleNo       String?   @db.VarChar(20)
+  createdAt       DateTime  @default(now())
+
+  warehouse     Warehouse           @relation(fields: [warehouseId], references: [id])
+  vendor        Vendor              @relation(fields: [vendorId], references: [id])
+  purchaseOrder PurchaseOrder?      @relation(fields: [purchaseOrderId], references: [id])
+  lines         InwardReceiptLine[]
+
+  @@index([warehouseId, receivedAt])
+  @@index([vendorId, receivedAt])
+  @@index([purchaseOrderId])
+}
+
+model InwardReceiptLine {
+  id                Int      @id @default(autoincrement())
+  inwardReceiptId   Int
+  purchaseOrderLineId Int?
+  productId         Int
+  receivedQty       Decimal  @db.Decimal(18, 3)
+  acceptedQty       Decimal  @default(0) @db.Decimal(18, 3)
+  rejectedQty       Decimal  @default(0) @db.Decimal(18, 3)
+
+  inwardReceipt     InwardReceipt      @relation(fields: [inwardReceiptId], references: [id], onDelete: Cascade)
+  purchaseOrderLine PurchaseOrderLine? @relation(fields: [purchaseOrderLineId], references: [id])
+  product           Product            @relation(fields: [productId], references: [id])
+  inspections       Inspection[]
+  batches           Batch[]
+
+  @@index([inwardReceiptId])
+  @@index([purchaseOrderLineId])
+  @@index([productId])
+}
+
+model Inspection {
+  id            Int              @id @default(autoincrement())
+  inwardLineId  Int
+  inspectorId   Int?
+  result        InspectionResult @default(PENDING)
+  sampleSize    Decimal?         @db.Decimal(18, 3)
+  defectPct     Decimal?         @db.Decimal(5, 2)
+  notes         String?          @db.Text
+  inspectedAt   DateTime         @default(now())
+
+  inwardLine InwardReceiptLine @relation(fields: [inwardLineId], references: [id])
+  inspector  User?             @relation(fields: [inspectorId], references: [id])
+
+  @@index([inwardLineId, inspectedAt])
+}
+
+// A lot. The unit of 100% traceability. Carries the denormalised "where is it NOW" columns.
+model Batch {
+  id                  Int                @id @default(autoincrement())
+  batchNo             String             @unique @db.VarChar(50)
+  traceabilityCode    String?            @unique @db.VarChar(30) // LOT-2026-XXXX, set at tag generation
+  complianceStatus    ValidationStatus   @default(PENDING) // PSI / lab outcome
+  currentOwner        BatchOwner         @default(EXPORTER)
+  productId           Int
+  vendorId            Int
+  inwardLineId        Int?
+  warehouseId         Int
+  locationId          Int?
+  status              BatchStatus        @default(RECEIVED_UNSORTED)
+  quantity            Decimal            @db.Decimal(18, 3)
+  availableQty        Decimal            @db.Decimal(18, 3)
+  unitCostInr         Decimal            @db.Decimal(18, 4) // procurement cost in INR at receipt
+  manufacturedOn      DateTime?          @db.Date
+  expiresOn           DateTime?          @db.Date
+  currentMilestone    TrackingMilestone?
+  currentMilestoneAt  DateTime?
+  currentLocationText String?            @db.VarChar(200)
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+
+  product           Product             @relation(fields: [productId], references: [id])
+  vendor            Vendor              @relation(fields: [vendorId], references: [id])
+  inwardLine        InwardReceiptLine?  @relation(fields: [inwardLineId], references: [id])
+  warehouse         Warehouse           @relation(fields: [warehouseId], references: [id])
+  location          WarehouseLocation?  @relation(fields: [locationId], references: [id])
+  tags              TraceTag[]
+  grades              BatchGrade[]
+  steps               ConsignmentStep[]
+  packagingRecords  PackagingRecord[]
+  labTests          LabTest[]
+  labelValidations  LabelValidation[]
+  shipmentItems     ShipmentItem[]
+  trackingEvents    ShipmentTrackingEvent[]
+
+  @@index([productId, status])
+  @@index([vendorId])
+  @@index([warehouseId, status])
+  @@index([currentMilestone, currentMilestoneAt])
+  @@index([expiresOn])
+  @@index([complianceStatus])
+}
+
+model TraceTag {
+  id          Int       @id @default(autoincrement())
+  batchId     Int
+  tagType     TagType
+  code        String    @unique @db.VarChar(128) // barcode string or RFID EPC
+  status      TagStatus @default(ACTIVE)
+  generatedAt DateTime  @default(now())
+  printedAt   DateTime?
+
+  batch          Batch                   @relation(fields: [batchId], references: [id])
+  trackingEvents ShipmentTrackingEvent[]
+
+  @@index([batchId, status])
+}
+
+// =============================================================================
+// PACKAGING & LAB COMPLIANCE
+// =============================================================================
+
+model PackagingRecord {
+  id                 Int             @id @default(autoincrement())
+  batchId            Int
+  shipmentId         Int?
+  packagingType      PackagingType
+  ispm15Treatment    Ispm15Treatment @default(NOT_APPLICABLE)
+  ispm15MarkNo       String?         @db.VarChar(40) // country/producer/treatment-provider mark
+  treatmentCertNo    String?         @db.VarChar(60)
+  treatmentProvider  String?         @db.VarChar(160)
+  treatedOn          DateTime?       @db.Date
+  ispm15Certified    Boolean         @default(false)
+  ispm15VerifiedById Int? // warehouse manager who verified the stamp
+  ispm15VerifiedAt   DateTime?
+  labelApproved      Boolean         @default(false)
+  packageCount       Int?
+  packedAt           DateTime        @default(now())
+
+  batch    Batch     @relation(fields: [batchId], references: [id])
+  shipment Shipment? @relation(fields: [shipmentId], references: [id])
+  ispm15VerifiedBy User? @relation("Ispm15Verifier", fields: [ispm15VerifiedById], references: [id])
+
+  @@index([batchId])
+  @@index([shipmentId])
+}
+
+model LabTest {
+  id               Int           @id @default(autoincrement())
+  batchId          Int
+  provider         LabProvider
+  referenceNo      String?       @db.VarChar(60)
+  testType         String        @db.VarChar(160)
+  status           LabTestStatus @default(SAMPLE_DISPATCHED)
+  sampleSentAt     DateTime?
+  reportReceivedAt DateTime?
+  validTill        DateTime?     @db.Date
+  reportUrl        String?       @db.VarChar(500)
+
+  batch Batch @relation(fields: [batchId], references: [id])
+
+  @@index([batchId, status])
+  @@index([provider, status])
+}
+
+model LabelValidation {
+  id           Int              @id @default(autoincrement())
+  batchId      Int
+  targetMarket String           @db.Char(2)
+  ruleSet      String           @db.VarChar(80) // e.g. FSSAI-LM-2011, EU-1169/2011
+  status       ValidationStatus @default(PENDING)
+  issues       Json?
+  validatedAt  DateTime?
+
+  batch Batch @relation(fields: [batchId], references: [id])
+
+  @@index([batchId, targetMarket])
+}
+
+// =============================================================================
+// LOGISTICS (SEA + AIR)
+// =============================================================================
+
+model Shipment {
+  id                  Int                @id @default(autoincrement())
+  shipmentNo          String             @unique @db.VarChar(40)
+  companyId           Int
+  direction           TradeDirection     @default(EXPORT)
+  mode                TransportMode
+  incoterm            Incoterm
+  status              ShipmentStatus     @default(DRAFT)
+  currentMilestone    TrackingMilestone?
+  currentMilestoneAt  DateTime?
+  currentLocationText String?            @db.VarChar(200)
+  buyerId             Int
+  consigneeId         Int?
+  forwarderId         Int?
+  chaId               Int?
+  carrierId           Int?
+  polId               Int
+  podId               Int
+  letterOfCreditId    Int?
+  invoiceCurrencyCode String             @db.Char(3)
+  etdPlanned          DateTime?
+  etd                 DateTime?
+  atd                 DateTime?
+  eta                 DateTime?
+  ata                 DateTime?
+  packageCount        Int?
+  grossWeightKg       Decimal?           @db.Decimal(14, 3)
+  netWeightKg         Decimal?           @db.Decimal(14, 3)
+  volumeCbm           Decimal?           @db.Decimal(12, 3)
+  declaredValue       Decimal            @default(0) @db.Decimal(18, 2)
+  requiresColdChain   Boolean            @default(false)
+  shippingBillNo      String?            @db.VarChar(20) // denormalised from ShippingBill (SB-XXXXXXXX)
+  manifestFiled       Boolean            @default(false) // IGM / ISF filed
+  pgaClearance        PgaState           @default(NOT_REQUIRED) // roll-up of RegulatoryClearance rows
+  transportDocCollectedAt DateTime?      // BL / AWB collected at departure
+  version             Int                @default(1)
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+
+  company         Company          @relation(fields: [companyId], references: [id])
+  buyer           Party            @relation("ShipmentBuyer", fields: [buyerId], references: [id])
+  consignee       Party?           @relation("ShipmentConsignee", fields: [consigneeId], references: [id])
+  forwarder       Party?           @relation("ShipmentForwarder", fields: [forwarderId], references: [id])
+  cha             Party?           @relation("ShipmentCha", fields: [chaId], references: [id])
+  carrier         Party?           @relation("ShipmentCarrier", fields: [carrierId], references: [id])
+  pol             Location         @relation("ShipmentPol", fields: [polId], references: [id])
+  pod             Location         @relation("ShipmentPod", fields: [podId], references: [id])
+  letterOfCredit  LetterOfCredit?  @relation(fields: [letterOfCreditId], references: [id])
+  invoiceCurrency Currency         @relation(fields: [invoiceCurrencyCode], references: [code])
+
+  items            ShipmentItem[]
+  seaDetail        SeaShipmentDetail?
+  airDetail        AirShipmentDetail?
+  containers       Container[]
+  trackingEvents   ShipmentTrackingEvent[]
+  statusHistory    ShipmentStatusHistory[]
+  temperatureReadings TemperatureReading[]
+  packagingRecords PackagingRecord[]
+  shippingBills    ShippingBill[]
+  billsOfEntry     BillOfEntry[]
+  manifests        ManifestFiling[]
+  clearances       RegulatoryClearance[]
+  complianceEvents ComplianceEvent[]
+  customsHolds     CustomsHold[]
+  icegateMessages  IcegateMessage[]
+  charges          ShipmentCharge[]
+  landedCostSheets LandedCostSheet[]
+  invoices         Invoice[]
+  steps            ConsignmentStep[]
+  ledgerEntries    FinanceLedgerEntry[]
+
+  @@index([companyId, status, createdAt])
+  @@index([mode, status])
+  @@index([direction, status])
+  @@index([polId, etd])
+  @@index([podId, eta])
+  @@index([buyerId, status])
+  @@index([carrierId, etd])
+  @@index([currentMilestone, currentMilestoneAt])
+  @@index([letterOfCreditId])
+}
+
+model ShipmentItem {
+  id             Int      @id @default(autoincrement())
+  shipmentId     Int
+  batchId        Int
+  batchGradeId   Int // graded child lot actually shipped (ungraded goods use a single UNGRADED child)
+  productId      Int
+  hsCodeId       Int // classification snapshot at shipment time
+  containerId    Int?
+  quantity       Decimal  @db.Decimal(18, 3)
+  unitPrice      Decimal  @db.Decimal(18, 4) // transaction price in Shipment.invoiceCurrencyCode
+  unitCostInr    Decimal  @db.Decimal(18, 4) // product cost basis in INR (snapshot of Batch.unitCostInr or purchase cost)
+  netWeightKg    Decimal? @db.Decimal(14, 3)
+  grossWeightKg  Decimal? @db.Decimal(14, 3)
+
+  shipment  Shipment   @relation(fields: [shipmentId], references: [id])
+  batch     Batch      @relation(fields: [batchId], references: [id])
+  batchGrade BatchGrade @relation(fields: [batchGradeId], references: [id])
+  product   Product    @relation(fields: [productId], references: [id])
+  hsCode    HsCode     @relation(fields: [hsCodeId], references: [id])
+  container Container? @relation(fields: [containerId], references: [id])
+
+  shippingBillItems ShippingBillItem[]
+  boeItems          BillOfEntryItem[]
+  invoiceLines      InvoiceLine[]
+  landedCostLines   LandedCostLine[]
+  landedCostItems   LandedCostItem[]
+
+  @@unique([shipmentId, batchGradeId])
+  @@index([shipmentId, batchId])
+  @@index([batchId])
+  @@index([productId])
+  @@index([hsCodeId])
+  @@index([containerId])
+}
+
+model SeaShipmentDetail {
+  id              Int               @id @default(autoincrement())
+  shipmentId      Int               @unique
+  loadType        ContainerLoadType
+  bookingNo       String?           @db.VarChar(40)
+  bookingDate     DateTime?         @db.Date
+  vesselName      String?           @db.VarChar(120)
+  voyageNo        String?           @db.VarChar(30)
+  imoNumber       String?           @db.VarChar(10)
+  mblNo           String?           @db.VarChar(40)
+  hblNo           String?           @db.VarChar(40)
+  cartingOrderNo  String?           @db.VarChar(40)
+  cartingValidTill DateTime?
+  cartingOrderVerifiedAt DateTime?
+  terminalName    String?           @db.VarChar(120)
+  gateCutoffAt    DateTime?
+  vgmCutoffAt     DateTime?
+  siCutoffAt      DateTime?
+  loadedOnVesselAt DateTime?
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id])
+
+  @@index([bookingNo])
+  @@index([vesselName, voyageNo])
+  @@index([mblNo])
+}
+
+model Container {
+  id                  Int              @id @default(autoincrement())
+  shipmentId          Int
+  containerNo         String           @db.VarChar(11)
+  containerType       ContainerType
+  loadType            ContainerLoadType @default(FCL)
+  sealNo              String?          @db.VarChar(30)
+  yardStackingType    YardStackingType @default(STANDARD)
+  yardSlot            String?          @db.VarChar(40) // block-bay-row-tier
+  reeferSetPointC     Decimal?         @db.Decimal(5, 2)
+  dataLoggerId        String?          @db.VarChar(40)
+  dataLoggerActivatedAt DateTime?
+  tareKg              Decimal?         @db.Decimal(12, 3)
+  vgmKg               Decimal?         @db.Decimal(12, 3)
+  freeDays            Int              @default(0)
+  demurrageRatePerDay Decimal?         @db.Decimal(12, 2) // INR per day after free time
+  freeTimeStartAt     DateTime?
+  gatedInAt           DateTime?
+  stackedAt           DateTime?
+  loadedAt            DateTime?
+
+  shipment        Shipment                @relation(fields: [shipmentId], references: [id])
+  items           ShipmentItem[]
+  trackingEvents  ShipmentTrackingEvent[]
+  temperatureReadings TemperatureReading[]
+  charges         ShipmentCharge[]
+
+  @@unique([shipmentId, containerNo])
+  @@index([containerNo])
+  @@index([yardStackingType])
+}
+
+model AirShipmentDetail {
+  id                      Int              @id @default(autoincrement())
+  shipmentId              Int              @unique
+  mawbNo                  String?          @unique @db.VarChar(13)
+  hawbNo                  String?          @db.VarChar(20)
+  flightNo                String?          @db.VarChar(10)
+  flightDate              DateTime?        @db.Date
+  temperatureZone         TemperatureZone  @default(AMBIENT)
+  setPointMinC            Decimal?         @db.Decimal(5, 2)
+  setPointMaxC            Decimal?         @db.Decimal(5, 2)
+  dataLoggerId            String?          @db.VarChar(40)
+  dataLoggerActivatedAt   DateTime?
+  coldChainGateInAt       DateTime?
+  gateInTempC             Decimal?         @db.Decimal(5, 2)
+  tarmacTransitStartAt    DateTime?
+  tarmacTransitEndAt      DateTime?
+  tarmacTransitLimitMins  Int              @default(30)
+  tarmacLimitBreached     Boolean          @default(false)
+  handedToAirlineAt       DateTime?
+
+  shipment      Shipment          @relation(fields: [shipmentId], references: [id])
+  handlingCodes AirHandlingCode[]
+
+  @@index([flightNo, flightDate])
+  @@index([temperatureZone])
+}
+
+model AirHandlingCode {
+  id                  Int              @id @default(autoincrement())
+  airShipmentDetailId Int
+  code                IataHandlingCode
+
+  airShipmentDetail AirShipmentDetail @relation(fields: [airShipmentDetailId], references: [id], onDelete: Cascade)
+
+  @@unique([airShipmentDetailId, code])
+}
+
+// Cold-chain sensor readings (BigInt: high volume)
+model TemperatureReading {
+  id          BigInt           @id @default(autoincrement())
+  shipmentId  Int
+  containerId Int?
+  sensorId    String?          @db.VarChar(40)
+  zone        TemperatureZone?
+  tempC       Decimal          @db.Decimal(5, 2)
+  isExcursion Boolean          @default(false)
+  recordedAt  DateTime
+
+  shipment  Shipment   @relation(fields: [shipmentId], references: [id])
+  container Container? @relation(fields: [containerId], references: [id])
+
+  @@index([shipmentId, recordedAt])
+  @@index([containerId, recordedAt])
+  @@index([isExcursion, recordedAt])
+}
+
+// Append-only real-time position log. Answers "where is batch X right now / what happened to it".
+model ShipmentTrackingEvent {
+  id          BigInt            @id @default(autoincrement())
+  shipmentId  Int
+  batchId     Int?
+  containerId Int?
+  tagId       Int?
+  locationId  Int?
+  actorId     Int?
+  milestone   TrackingMilestone
+  locationText String?          @db.VarChar(200)
+  temperatureC Decimal?         @db.Decimal(5, 2)
+  source      TrackingSource    @default(MANUAL)
+  payload     Json?
+  remarks     String?           @db.VarChar(500)
+  occurredAt  DateTime
+  recordedAt  DateTime          @default(now())
+
+  shipment  Shipment   @relation(fields: [shipmentId], references: [id])
+  batch     Batch?     @relation(fields: [batchId], references: [id])
+  container Container? @relation(fields: [containerId], references: [id])
+  tag       TraceTag?  @relation(fields: [tagId], references: [id])
+  location  Location?  @relation(fields: [locationId], references: [id])
+  actor     User?      @relation(fields: [actorId], references: [id])
+
+  @@index([shipmentId, occurredAt])
+  @@index([batchId, occurredAt])
+  @@index([containerId, occurredAt])
+  @@index([tagId, occurredAt])
+  @@index([milestone, occurredAt])
+  @@index([locationId, occurredAt])
+}
+
+// Append-only high-level status transitions
+model ShipmentStatusHistory {
+  id         BigInt          @id @default(autoincrement())
+  shipmentId Int
+  fromStatus ShipmentStatus?
+  toStatus   ShipmentStatus
+  reason     String?         @db.VarChar(300)
+  actorId    Int?
+  meta       Json?
+  changedAt  DateTime        @default(now())
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id])
+  actor    User?    @relation(fields: [actorId], references: [id])
+
+  @@index([shipmentId, changedAt])
+  @@index([toStatus, changedAt])
+}
+
+// =============================================================================
+// PORT, CUSTOMS & BORDER
+// =============================================================================
+
+model ShippingBill {
+  id            Int                @id @default(autoincrement())
+  shipmentId    Int
+  portId        Int
+  sbNo          String?            @db.VarChar(10)
+  sbDate        DateTime?          @db.Date
+  status        ShippingBillStatus @default(DRAFT)
+  igstMode      IgstPaymentMode    @default(LUT_ZERO_RATED)
+  fobValueInr   Decimal?           @db.Decimal(18, 2)
+  fobValueFcy   Decimal?           @db.Decimal(18, 2)
+  exchangeRate  Decimal?           @db.Decimal(18, 6)
+  icegateRefNo  String?            @db.VarChar(40)
+  filedAt       DateTime?
+  leoNo         String?            @db.VarChar(20)
+  leoDate       DateTime?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  shipment Shipment           @relation(fields: [shipmentId], references: [id])
+  port     Location           @relation(fields: [portId], references: [id])
+  items    ShippingBillItem[]
+  incentives IncentiveClaim[]
+
+  @@unique([portId, sbNo, sbDate])
+  @@index([shipmentId])
+  @@index([status, filedAt])
+  @@index([leoNo])
+}
+
+model ShippingBillItem {
+  id               Int     @id @default(autoincrement())
+  shippingBillId   Int
+  shipmentItemId   Int
+  hsCodeId         Int
+  quantity         Decimal @db.Decimal(18, 3)
+  fobValueInr      Decimal @db.Decimal(18, 2)
+  igstAmount       Decimal @default(0) @db.Decimal(18, 2)
+  rodtepRate       Decimal @default(0) @db.Decimal(7, 4)
+  rodtepAmount     Decimal @default(0) @db.Decimal(18, 2)
+  drawbackRate     Decimal @default(0) @db.Decimal(7, 4)
+  drawbackAmount   Decimal @default(0) @db.Decimal(18, 2)
+
+  shippingBill ShippingBill @relation(fields: [shippingBillId], references: [id], onDelete: Cascade)
+  shipmentItem ShipmentItem @relation(fields: [shipmentItemId], references: [id])
+  hsCode       HsCode       @relation(fields: [hsCodeId], references: [id])
+
+  @@index([shippingBillId])
+  @@index([shipmentItemId])
+  @@index([hsCodeId])
+}
+
+model BillOfEntry {
+  id                  Int       @id @default(autoincrement())
+  shipmentId          Int
+  portId              Int
+  boeNo               String?   @db.VarChar(20)
+  boeDate             DateTime? @db.Date
+  status              BoeStatus @default(DRAFT)
+  exchangeRate        Decimal?  @db.Decimal(18, 6)
+  assessableValueInr  Decimal   @default(0) @db.Decimal(18, 2)
+  bcdAmount           Decimal   @default(0) @db.Decimal(18, 2)
+  swsAmount           Decimal   @default(0) @db.Decimal(18, 2)
+  additionalDutyAmount Decimal  @default(0) @db.Decimal(18, 2)
+  igstAmount          Decimal   @default(0) @db.Decimal(18, 2)
+  totalDutyInr        Decimal   @default(0) @db.Decimal(18, 2)
+  dutyPaidAt          DateTime?
+  oocNo               String?   @db.VarChar(20)
+  oocAt               DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  shipment Shipment          @relation(fields: [shipmentId], references: [id])
+  port     Location          @relation(fields: [portId], references: [id])
+  items    BillOfEntryItem[]
+
+  @@unique([portId, boeNo, boeDate])
+  @@index([shipmentId])
+  @@index([status, boeDate])
+  @@index([oocAt])
+}
+
+model BillOfEntryItem {
+  id                  Int     @id @default(autoincrement())
+  billOfEntryId       Int
+  shipmentItemId      Int
+  hsCodeId            Int
+  assessableValueInr  Decimal @db.Decimal(18, 2)
+  bcdRate             Decimal @db.Decimal(7, 4)
+  bcdAmount           Decimal @db.Decimal(18, 2)
+  swsAmount           Decimal @db.Decimal(18, 2)
+  additionalDutyAmount Decimal @default(0) @db.Decimal(18, 2)
+  igstRate            Decimal @db.Decimal(7, 4)
+  igstAmount          Decimal @db.Decimal(18, 2)
+  totalDutyInr        Decimal @db.Decimal(18, 2)
+
+  billOfEntry  BillOfEntry @relation(fields: [billOfEntryId], references: [id], onDelete: Cascade)
+  shipmentItem ShipmentItem @relation(fields: [shipmentItemId], references: [id])
+  hsCode       HsCode       @relation(fields: [hsCodeId], references: [id])
+
+  @@index([billOfEntryId])
+  @@index([shipmentItemId])
+  @@index([hsCodeId])
+}
+
+model ManifestFiling {
+  id          Int            @id @default(autoincrement())
+  shipmentId  Int
+  type        ManifestType
+  referenceNo String?        @db.VarChar(40)
+  status      ManifestStatus @default(DRAFT)
+  ackNo       String?        @db.VarChar(40)
+  filedAt     DateTime?
+  payload     Json?
+  createdAt   DateTime       @default(now())
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id])
+
+  @@index([shipmentId, type])
+  @@index([type, status])
+  @@index([referenceNo])
+}
+
+// ICEGATE / EDI message log (append-only)
+model IcegateMessage {
+  id          BigInt           @id @default(autoincrement())
+  shipmentId  Int?
+  messageType String           @db.VarChar(30) // SB, BE, IGM, EGM, ISF, ...
+  direction   MessageDirection
+  referenceNo String?          @db.VarChar(60)
+  httpStatus  Int?
+  request     Json?
+  response    Json?
+  createdAt   DateTime         @default(now())
+
+  shipment Shipment? @relation(fields: [shipmentId], references: [id])
+
+  @@index([shipmentId, createdAt])
+  @@index([messageType, createdAt])
+  @@index([referenceNo])
+}
+
+model CustomsHold {
+  id           Int               @id @default(autoincrement())
+  shipmentId   Int
+  reason       CustomsHoldReason
+  status       HoldStatus        @default(ACTIVE)
+  note         String?           @db.VarChar(500)
+  placedById   Int?
+  placedAt     DateTime          @default(now())
+  releasedAt   DateTime?
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id])
+  placedBy User?    @relation(fields: [placedById], references: [id])
+
+  @@index([shipmentId, status])
+  @@index([status, placedAt])
+}
+
+// =============================================================================
+// REGULATORY COMPLIANCE (PGA)
+// =============================================================================
+
+model RegulatoryClearance {
+  id             Int             @id @default(autoincrement())
+  shipmentId     Int
+  board          ClearanceBoard
+  status         ClearanceStatus @default(REQUIRED)
+  ruleId         Int?
+  hsCodeId       Int?
+  applicationNo  String?         @db.VarChar(60)
+  referenceNo    String?         @db.VarChar(60)
+  requiredBy     DateTime?
+  submittedAt    DateTime?
+  approvedAt     DateTime?
+  validTill      DateTime?       @db.Date
+  documentUrl    String?         @db.VarChar(500)
+  officerNote    String?         @db.VarChar(500)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  shipment Shipment          @relation(fields: [shipmentId], references: [id])
+  rule     HsRegulatoryRule? @relation(fields: [ruleId], references: [id])
+  hsCode   HsCode?           @relation(fields: [hsCodeId], references: [id])
+  events   ComplianceEvent[]
+
+  @@unique([shipmentId, board])
+  @@index([board, status])
+  @@index([ruleId])
+  @@index([hsCodeId])
+}
+
+// Append-only compliance trail
+model ComplianceEvent {
+  id          BigInt              @id @default(autoincrement())
+  shipmentId  Int
+  clearanceId Int?
+  board       ClearanceBoard
+  type        ComplianceEventType
+  message     String?             @db.VarChar(500)
+  payload     Json?
+  actorId     Int?
+  createdAt   DateTime            @default(now())
+
+  shipment  Shipment             @relation(fields: [shipmentId], references: [id])
+  clearance RegulatoryClearance? @relation(fields: [clearanceId], references: [id])
+  actor     User?                @relation(fields: [actorId], references: [id])
+
+  @@index([shipmentId, createdAt])
+  @@index([clearanceId, createdAt])
+  @@index([board, type, createdAt])
+}
+
+model IncentiveClaim {
+  id             Int             @id @default(autoincrement())
+  shippingBillId Int
+  scheme         IncentiveScheme
+  status         IncentiveStatus @default(ELIGIBLE)
+  rate           Decimal?        @db.Decimal(7, 4)
+  claimAmountInr Decimal         @db.Decimal(18, 2)
+  scripNo        String?         @db.VarChar(40)
+  scrollNo       String?         @db.VarChar(40)
+  creditedAt     DateTime?
+  createdAt      DateTime        @default(now())
+
+  shippingBill ShippingBill @relation(fields: [shippingBillId], references: [id])
+
+  @@index([shippingBillId])
+  @@index([scheme, status])
+}
+
+// =============================================================================
+// FINANCE
+// =============================================================================
+
+// Actual / estimated charges posted against a shipment (freight, THC, demurrage, ...)
+model ShipmentCharge {
+  id              Int                 @id @default(autoincrement())
+  shipmentId      Int
+  containerId     Int?
+  payeeId         Int?
+  component       LandedCostComponent
+  description     String?             @db.VarChar(200)
+  amount          Decimal             @db.Decimal(18, 2)
+  currencyCode    String              @db.Char(3)
+  allocationBasis AllocationBasis     @default(VALUE)
+  isEstimated     Boolean             @default(false)
+  invoiceRef      String?             @db.VarChar(60)
+  incurredOn      DateTime            @db.Date
+  createdAt       DateTime            @default(now())
+
+  shipment  Shipment   @relation(fields: [shipmentId], references: [id])
+  container Container? @relation(fields: [containerId], references: [id])
+  payee     Party?     @relation(fields: [payeeId], references: [id])
+  currency  Currency   @relation(fields: [currencyCode], references: [code])
+
+  @@index([shipmentId, component])
+  @@index([containerId])
+  @@index([payeeId])
+  @@index([currencyCode])
+}
+
+// Versioned landed-cost computation. Older sheets are marked SUPERSEDED, never deleted.
+model LandedCostSheet {
+  id                Int              @id @default(autoincrement())
+  shipmentId        Int
+  versionNo         Int
+  status            LandedCostStatus @default(PROVISIONAL)
+  totalInr          Decimal          @db.Decimal(18, 2) // excludes recoverable taxes
+  recoverableTaxInr Decimal          @default(0) @db.Decimal(18, 2)
+  hasEstimates      Boolean          @default(false)
+  notes             String?          @db.VarChar(500)
+  computedById      Int?
+  computedAt        DateTime         @default(now())
+
+  shipment   Shipment          @relation(fields: [shipmentId], references: [id])
+  computedBy User?             @relation(fields: [computedById], references: [id])
+  lines      LandedCostLine[]
+  items      LandedCostItem[]
+
+  @@unique([shipmentId, versionNo])
+  @@index([shipmentId, status])
+}
+
+model LandedCostLine {
+  id             BigInt              @id @default(autoincrement())
+  sheetId        Int
+  shipmentItemId Int
+  component      LandedCostComponent
+  description    String?             @db.VarChar(300)
+  originalAmount Decimal             @db.Decimal(18, 2)
+  currencyCode   String              @db.Char(3)
+  fxRate         Decimal             @db.Decimal(18, 6)
+  amountInr      Decimal             @db.Decimal(18, 2)
+  isRecoverable  Boolean             @default(false)
+  isEstimated    Boolean             @default(false)
+
+  sheet        LandedCostSheet @relation(fields: [sheetId], references: [id], onDelete: Cascade)
+  shipmentItem ShipmentItem    @relation(fields: [shipmentItemId], references: [id])
+  currency     Currency        @relation(fields: [currencyCode], references: [code])
+
+  @@index([sheetId, component])
+  @@index([shipmentItemId])
+  @@index([currencyCode])
+}
+
+model LandedCostItem {
+  id                  Int     @id @default(autoincrement())
+  sheetId             Int
+  shipmentItemId      Int
+  quantity            Decimal @db.Decimal(18, 3)
+  totalInr            Decimal @db.Decimal(18, 2)
+  landedUnitCostInr   Decimal @db.Decimal(18, 4)
+
+  sheet        LandedCostSheet @relation(fields: [sheetId], references: [id], onDelete: Cascade)
+  shipmentItem ShipmentItem    @relation(fields: [shipmentItemId], references: [id])
+
+  @@unique([sheetId, shipmentItemId])
+  @@index([shipmentItemId])
+}
+
+model LetterOfCredit {
+  id               Int      @id @default(autoincrement())
+  lcNo             String   @db.VarChar(40)
+  companyId        Int // beneficiary (exports) / applicant (imports)
+  applicantId      Int
+  issuingBankId    Int
+  advisingBankId   Int?
+  type             LcType
+  status           LcStatus @default(OPENED)
+  currencyCode     String   @db.Char(3)
+  amount           Decimal  @db.Decimal(18, 2)
+  tolerancePct     Decimal  @default(0) @db.Decimal(5, 2)
+  usanceDays       Int?
+  presentationDays Int      @default(21)
+  issueDate        DateTime @db.Date
+  expiryDate       DateTime @db.Date
+  latestShipmentDate DateTime? @db.Date
+  documentUrl      String?  @db.VarChar(500) // attached LC PDF copy
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  company      Company          @relation(fields: [companyId], references: [id])
+  applicant    Party            @relation("LcApplicant", fields: [applicantId], references: [id])
+  issuingBank  Bank             @relation("LcIssuingBank", fields: [issuingBankId], references: [id])
+  advisingBank Bank?            @relation("LcAdvisingBank", fields: [advisingBankId], references: [id])
+  currency     Currency         @relation(fields: [currencyCode], references: [code])
+  milestones   LcMilestone[]
+  shipments    Shipment[]
+  ledgerEntries FinanceLedgerEntry[]
+
+  @@unique([issuingBankId, lcNo])
+  @@index([companyId, status, expiryDate])
+  @@index([applicantId])
+  @@index([advisingBankId])
+  @@index([currencyCode])
+}
+
+model LcMilestone {
+  id          Int             @id @default(autoincrement())
+  lcId        Int
+  type        LcMilestoneType
+  status      MilestoneStatus @default(PENDING)
+  dueDate     DateTime?       @db.Date
+  completedAt DateTime?
+  amount      Decimal?        @db.Decimal(18, 2)
+  note        String?         @db.VarChar(300)
+
+  lc LetterOfCredit @relation(fields: [lcId], references: [id])
+
+  @@index([lcId, dueDate])
+  @@index([type, status, dueDate])
+}
+
+model BankGuarantee {
+  id              Int      @id @default(autoincrement())
+  bgNo            String   @unique @db.VarChar(40)
+  companyId       Int
+  bankId          Int
+  type            BgType
+  beneficiary     String   @db.VarChar(200)
+  currencyCode    String   @db.Char(3)
+  amount          Decimal  @db.Decimal(18, 2)
+  marginPct       Decimal  @default(0) @db.Decimal(5, 2)
+  issueDate       DateTime @db.Date
+  expiryDate      DateTime @db.Date
+  claimExpiryDate DateTime? @db.Date
+  status          BgStatus @default(ACTIVE)
+  createdAt       DateTime @default(now())
+
+  company  Company  @relation(fields: [companyId], references: [id])
+  bank     Bank     @relation(fields: [bankId], references: [id])
+  currency Currency @relation(fields: [currencyCode], references: [code])
+
+  @@index([companyId, status, expiryDate])
+  @@index([bankId])
+  @@index([currencyCode])
+}
+
+model WorkingCapitalSnapshot {
+  id             Int      @id @default(autoincrement())
+  companyId      Int
+  asOfDate       DateTime @db.Date
+  inventoryInr   Decimal  @db.Decimal(18, 2)
+  receivablesInr Decimal  @db.Decimal(18, 2)
+  payablesInr    Decimal  @db.Decimal(18, 2)
+  lcExposureInr  Decimal  @default(0) @db.Decimal(18, 2)
+  bgExposureInr  Decimal  @default(0) @db.Decimal(18, 2)
+  gapInr         Decimal  @db.Decimal(18, 2) // inventory + receivables - payables
+  createdAt      DateTime @default(now())
+
+  company Company @relation(fields: [companyId], references: [id])
+
+  @@unique([companyId, asOfDate])
+}
+
+model Invoice {
+  id             Int             @id @default(autoincrement())
+  invoiceNo      String          @db.VarChar(40)
+  companyId      Int
+  shipmentId     Int
+  lutId          Int?
+  type           InvoiceType     @default(COMMERCIAL)
+  status         InvoiceStatus   @default(DRAFT)
+  currencyCode   String          @db.Char(3)
+  exchangeRate   Decimal         @db.Decimal(18, 6)
+  invoiceDate    DateTime        @db.Date
+  dueDate        DateTime?       @db.Date
+  subtotal       Decimal         @db.Decimal(18, 2)
+  freight        Decimal         @default(0) @db.Decimal(18, 2)
+  insurance      Decimal         @default(0) @db.Decimal(18, 2)
+  totalAmount    Decimal         @db.Decimal(18, 2)
+  taxableValueInr Decimal        @db.Decimal(18, 2)
+  igstMode       IgstPaymentMode @default(LUT_ZERO_RATED)
+  igstAmountInr  Decimal         @default(0) @db.Decimal(18, 2)
+  paymentTerms   String?         @db.VarChar(120)
+  createdAt      DateTime        @default(now())
+
+  company  Company          @relation(fields: [companyId], references: [id])
+  shipment Shipment         @relation(fields: [shipmentId], references: [id])
+  lut      LutRegistration? @relation(fields: [lutId], references: [id])
+  currency Currency         @relation(fields: [currencyCode], references: [code])
+  lines    InvoiceLine[]
+  ledgerEntries FinanceLedgerEntry[]
+
+  @@unique([companyId, invoiceNo])
+  @@index([shipmentId])
+  @@index([lutId])
+  @@index([currencyCode])
+  @@index([status, dueDate])
+}
+
+model InvoiceLine {
+  id             Int     @id @default(autoincrement())
+  invoiceId      Int
+  shipmentItemId Int?
+  hsCodeId       Int
+  description    String  @db.VarChar(300)
+  quantity       Decimal @db.Decimal(18, 3)
+  unitPrice      Decimal @db.Decimal(18, 4)
+  amount         Decimal @db.Decimal(18, 2)
+  igstRate       Decimal @default(0) @db.Decimal(7, 4)
+  igstAmountInr  Decimal @default(0) @db.Decimal(18, 2)
+
+  invoice      Invoice       @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  shipmentItem ShipmentItem? @relation(fields: [shipmentItemId], references: [id])
+  hsCode       HsCode        @relation(fields: [hsCodeId], references: [id])
+
+  @@index([invoiceId])
+  @@index([shipmentItemId])
+  @@index([hsCodeId])
+}
+
+// =============================================================================
+// AUDIT
+// =============================================================================
+
+// Generic append-only change log for masters/documents not covered by a dedicated history table.
+model AuditLog {
+  id        BigInt      @id @default(autoincrement())
+  entity    String      @db.VarChar(64)
+  entityId  String      @db.VarChar(64)
+  action    AuditAction
+  actorId   Int?
+  requestId String?     @db.VarChar(64)
+  before    Json?
+  after     Json?
+  createdAt DateTime    @default(now())
+
+  actor User? @relation(fields: [actorId], references: [id])
+
+  @@index([entity, entityId, createdAt])
+  @@index([actorId, createdAt])
+}
+
+// =============================================================================
+// CONSIGNMENT WORKFLOW TRACKING — End-to-End EXIM Operational Checklist
+// =============================================================================
+
+enum BatchOwner {
+  SUPPLIER
+  EXPORTER
+  IMPORT_PARTY
+}
+
+enum PgaState {
+  NOT_REQUIRED
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum WorkflowStage {
+  SOURCING
+  WAREHOUSE
+  PACKAGING_COMPLIANCE
+  EXPORT_CUSTOMS
+  IMPORT_CUSTOMS
+  LAST_MILE
+}
+
+enum WorkflowStepCode {
+  VENDOR_COMPLIANCE_VERIFICATION
+  INCOTERM_PI_EXECUTION
+  FOREX_RISK_MITIGATION
+  TRADE_FINANCE_ACTIVATION
+  INWARD_DOCK_INSPECTION
+  SORTING_QUALITY_GRADING
+  TRACEABILITY_TOKEN_GENERATION
+  ISPM15_PACKAGING
+  PSI_LAB_TESTING
+  TARGET_MARKET_LABEL_VALIDATION
+  SHIPPING_BILL_FILING
+  ZERO_RATED_INCENTIVE_LOGGING
+  CUSTOMS_EXAMINATION_LEO
+  PORT_TERMINAL_HANDLING_LOADING
+  DEPARTURE_CONFIRMATION
+  PRE_ARRIVAL_MANIFEST_FILING
+  BILL_OF_ENTRY_SUBMISSION
+  PGA_CLEARANCES
+  DUTY_ASSESSMENT_OOC
+  LANDED_COST_CONSOLIDATION
+  LAST_MILE_TRANSPORTATION
+  DELIVERY_PROOF_QUALITY_SIGNOFF
+  FINANCIAL_RECONCILIATION
+}
+
+enum StepStatus {
+  PENDING
+  IN_PROGRESS
+  DONE
+  BLOCKED
+  SKIPPED
+}
+
+enum LedgerEntryType {
+  FORWARD_CONTRACT_BOOKED
+  LC_OPENED
+  BANK_GUARANTEE_ISSUED
+  EXPECTED_RODTEP
+  EXPECTED_DRAWBACK
+  INCENTIVE_CREDITED
+  LANDED_COST_POSTED
+  COLLECTION_RECEIVED
+  FX_DIFFERENCE_SETTLED
+}
+
+// Bulk batch -> granular graded child lots (Stage 2 "Sorting & Quality Grading Tiers").
+// Invariant (enforced in the grading service): sum(child.quantity) <= Batch.quantity.
+model BatchGrade {
+  id           Int       @id @default(autoincrement())
+  batchId      Int
+  gradeTier    GradeTier
+  weightKg     Decimal   @db.Decimal(14, 3)
+  quantity     Decimal   @db.Decimal(18, 3)
+  availableQty Decimal   @db.Decimal(18, 3)
+  gradedAt     DateTime  @default(now())
+
+  batch         Batch          @relation(fields: [batchId], references: [id])
+  shipmentItems ShipmentItem[]
+
+  @@unique([batchId, gradeTier])
+  @@index([gradeTier])
+}
+
+// One row per (checklist step, subject). The subject is exactly ONE of vendor / PO / batch / shipment
+// (strict FKs instead of a polymorphic id). Add this CHECK in the first migration:
+//   ALTER TABLE ConsignmentStep ADD CONSTRAINT chk_one_subject CHECK
+//     ((vendorId IS NOT NULL) + (purchaseOrderId IS NOT NULL) + (batchId IS NOT NULL) + (shipmentId IS NOT NULL) = 1);
+model ConsignmentStep {
+  id              Int              @id @default(autoincrement())
+  stepCode        WorkflowStepCode
+  stage           WorkflowStage
+  status          StepStatus       @default(PENDING)
+  vendorId        Int?
+  purchaseOrderId Int?
+  batchId         Int?
+  shipmentId      Int?
+  completedAt     DateTime?
+  completedById   Int?
+  evidenceUrl     String?          @db.VarChar(500)
+  note            String?          @db.VarChar(500)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  vendor        Vendor?        @relation(fields: [vendorId], references: [id])
+  purchaseOrder PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
+  batch         Batch?         @relation(fields: [batchId], references: [id])
+  shipment      Shipment?      @relation(fields: [shipmentId], references: [id])
+  completedBy   User?          @relation(fields: [completedById], references: [id])
+
+  @@unique([stepCode, vendorId])
+  @@unique([stepCode, purchaseOrderId])
+  @@unique([stepCode, batchId])
+  @@unique([stepCode, shipmentId])
+  @@index([shipmentId, stage, status])
+  @@index([batchId, status])
+  @@index([vendorId])
+  @@index([purchaseOrderId])
+  @@index([completedById])
+  @@index([stage, status])
+}
+
+// Append-only finance ledger: forward-contract token + fixed rate, LC opened, expected drawback/RoDTEP, etc.
+model FinanceLedgerEntry {
+  id                Int             @id @default(autoincrement())
+  companyId         Int
+  shipmentId        Int?
+  forwardContractId Int?
+  letterOfCreditId  Int?
+  invoiceId         Int?
+  entryType         LedgerEntryType
+  reference         String?         @db.VarChar(60) // forward-contract token / LC no / scroll no
+  currencyCode      String          @db.Char(3)
+  amount            Decimal         @db.Decimal(18, 2)
+  fixedRate         Decimal?        @db.Decimal(18, 6)
+  amountInr         Decimal         @db.Decimal(18, 2)
+  note              String?         @db.VarChar(300)
+  postedAt          DateTime        @default(now())
+
+  company         Company          @relation(fields: [companyId], references: [id])
+  shipment        Shipment?        @relation(fields: [shipmentId], references: [id])
+  forwardContract ForwardContract? @relation(fields: [forwardContractId], references: [id])
+  letterOfCredit  LetterOfCredit?  @relation(fields: [letterOfCreditId], references: [id])
+  invoice         Invoice?         @relation(fields: [invoiceId], references: [id])
+  currency        Currency         @relation(fields: [currencyCode], references: [code])
+
+  @@index([companyId, entryType, postedAt])
+  @@index([shipmentId, entryType])
+  @@index([forwardContractId])
+  @@index([letterOfCreditId])
+  @@index([invoiceId])
+  @@index([currencyCode])
+}
