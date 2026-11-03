@@ -115,19 +115,7 @@ async function run(tx: Tx, input: PortArrivalInput): Promise<PortArrivalResult> 
   const asOf = input.asOf ?? new Date();
   const warnings: string[] = [];
 
-  const shipment = await tx.shipment.findUnique({
-    where: { id: shipmentId },
-    include: {
-      pol: true,
-      pod: true,
-      items: { include: { hsCode: true } },
-      containers: true,
-      seaDetail: true,
-      airDetail: true,
-      charges: true,
-      clearances: true,
-    },
-  });
+  const shipment = await loadShipmentForCosting(tx, shipmentId);
   if (!shipment) throw new DomainError('SHIPMENT_NOT_FOUND', `Shipment ${shipmentId} does not exist.`, 404);
 
   // Idempotency: already processed → return current state, write nothing.
@@ -208,131 +196,12 @@ async function run(tx: Tx, input: PortArrivalInput): Promise<PortArrivalResult> 
       .filter(Boolean)
       .join(' · ') || null);
 
-  // 3 ─ Landed cost
-  const jurisdiction = shipment.direction === 'IMPORT' ? 'IN' : shipment.pod.countryCode;
-  const hsIds = [...new Set(shipment.items.map((i) => i.hsCodeId))];
-  const rateRows = await tx.hsDutyRate.findMany({
-    where: {
-      hsCodeId: { in: hsIds },
-      countryCode: jurisdiction,
-      effectiveFrom: { lte: asOf },
-      OR: [{ effectiveTo: null }, { effectiveTo: { gte: asOf } }],
-    },
-    orderBy: { effectiveFrom: 'desc' },
-  });
-  const dutyByHs = new Map<number, DutyRates>();
-  for (const r of rateRows) {
-    if (!dutyByHs.has(r.hsCodeId)) {
-      dutyByHs.set(r.hsCodeId, {
-        bcdRate: r.bcdRate,
-        swsRate: r.swsRate,
-        additionalDutyRate: r.additionalDutyRate,
-        igstRate: r.igstRate,
-      });
-    }
-  }
-
-  const charges: CalcChargeInput[] = [];
-  for (const c of shipment.charges) {
-    if (COMPUTED_COMPONENTS.has(c.component)) {
-      warnings.push(`Posted ${c.component} charge #${c.id} ignored — that component is computed by the duty engine.`);
-      continue;
-    }
-    charges.push({
-      component: c.component,
-      amount: c.amount,
-      currency: c.currencyCode,
-      basis: c.allocationBasis,
-      isEstimated: c.isEstimated,
-      description: c.description ?? undefined,
-    });
-  }
-  // Accrue demurrage per container unless an actual demurrage charge was already posted for it.
-  for (const c of containerView) {
-    const posted = shipment.charges.some((x) => x.component === 'DEMURRAGE' && x.containerId === c.id);
-    if (posted || !c.freeTimeStartAt || !c.demurrageRatePerDay) continue;
-    const days = accruedDemurrageDays(c.freeTimeStartAt, asOf, c.freeDays);
-    if (days > 0) {
-      charges.push({
-        component: 'DEMURRAGE',
-        amount: c.demurrageRatePerDay.times(days),
-        currency: 'INR',
-        basis: 'VALUE',
-        isEstimated: true,
-        description: `Container ${c.containerNo}: ${days} day(s) beyond ${c.freeDays} free`,
-      });
-    }
-  }
-
-  const currencies = [shipment.invoiceCurrencyCode, ...charges.map((c) => c.currency)];
-  const { lookup: fx, warnings: fxWarnings } = await buildFx(tx, currencies, asOf);
-  warnings.push(...fxWarnings);
-
-  const valuation = VALUATION_POLICY[jurisdiction] ?? DEFAULT_VALUATION;
-  const items: CalcItemInput[] = shipment.items.map((i) => ({
-    shipmentItemId: i.id,
-    hsCode: i.hsCode.code,
-    quantity: i.quantity,
-    unitPrice: i.unitPrice,
-    unitCostInr: i.unitCostInr,
-    netWeightKg: i.netWeightKg,
-    duty: dutyByHs.get(i.hsCodeId) ?? null,
-  }));
-
-  const calc = calculateLandedCost({
-    items,
-    charges,
-    invoiceCurrency: shipment.invoiceCurrencyCode,
-    fx,
-    policy: {
-      jurisdiction,
-      incoterm: shipment.incoterm,
-      igstRecoverable: input.igstRecoverable ?? true,
-      landingChargePct: D(valuation.landingChargePct),
-      defaultInsurancePctOfFob: valuation.defaultInsurancePctOfFob ? D(valuation.defaultInsurancePctOfFob) : null,
-    },
-  });
-  warnings.push(...calc.warnings);
-
-  await tx.landedCostSheet.updateMany({
-    where: { shipmentId: shipment.id, status: { not: 'SUPERSEDED' } },
-    data: { status: 'SUPERSEDED' },
-  });
-  const last = await tx.landedCostSheet.aggregate({ where: { shipmentId: shipment.id }, _max: { versionNo: true } });
-  const sheet = await tx.landedCostSheet.create({
-    data: {
-      shipmentId: shipment.id,
-      versionNo: (last._max.versionNo ?? 0) + 1,
-      status: calc.hasEstimates ? 'PROVISIONAL' : 'FINAL',
-      totalInr: calc.totalInr,
-      recoverableTaxInr: calc.recoverableTaxInr,
-      hasEstimates: calc.hasEstimates,
-      notes: calc.warnings.join(' | ').slice(0, 500) || null,
-      computedById: actorId,
-    },
-  });
-  await tx.landedCostLine.createMany({
-    data: calc.lines.map((l) => ({
-      sheetId: sheet.id,
-      shipmentItemId: l.shipmentItemId,
-      component: l.component,
-      description: l.description,
-      originalAmount: l.originalAmount,
-      currencyCode: l.currency,
-      fxRate: l.fxRate,
-      amountInr: l.amountInr,
-      isRecoverable: l.isRecoverable,
-      isEstimated: l.isEstimated,
-    })),
-  });
-  await tx.landedCostItem.createMany({
-    data: calc.items.map((i) => ({
-      sheetId: sheet.id,
-      shipmentItemId: i.shipmentItemId,
-      quantity: i.quantity,
-      totalInr: i.totalInr,
-      landedUnitCostInr: i.landedUnitCostInr,
-    })),
+  // 3 ─ Landed cost (shared with re-costing; see computeLandedCostSheet)
+  const { sheet, calc } = await computeLandedCostSheet(tx, shipment, containerView, {
+    asOf,
+    igstRecoverable: input.igstRecoverable ?? true,
+    actorId,
+    warnings,
   });
 
   // 4 ─ Regulatory triggers (FSSAI / BIS / CDSCO / quarantine …)
@@ -628,4 +497,163 @@ async function loadExisting(
     })),
     warnings: [],
   };
+}
+
+// ── Costing (exported so the finance module can re-cost with actual charges) ─
+export function loadShipmentForCosting(tx: Tx, shipmentId: number) {
+  return tx.shipment.findUnique({
+    where: { id: shipmentId },
+    include: {
+      pol: true,
+      pod: true,
+      items: { include: { hsCode: true } },
+      containers: true,
+      seaDetail: true,
+      airDetail: true,
+      charges: true,
+      clearances: true,
+    },
+  });
+}
+type CostingShipment = NonNullable<Awaited<ReturnType<typeof loadShipmentForCosting>>>;
+
+/**
+ * Compute a landed-cost sheet from current duty rates, FX and posted charges, supersede any earlier sheet and
+ * save the new version (FINAL when no estimate was used, else PROVISIONAL). Pure of side effects beyond the sheet rows.
+ */
+export async function computeLandedCostSheet(
+  tx: Tx,
+  shipment: CostingShipment,
+  containerView: CostingShipment['containers'],
+  opts: { asOf: Date; igstRecoverable: boolean; actorId?: number; warnings: string[] },
+) {
+  const { asOf, actorId, warnings } = opts;
+  const jurisdiction = shipment.direction === 'IMPORT' ? 'IN' : shipment.pod.countryCode;
+  const hsIds = [...new Set(shipment.items.map((i) => i.hsCodeId))];
+  const rateRows = await tx.hsDutyRate.findMany({
+    where: {
+      hsCodeId: { in: hsIds },
+      countryCode: jurisdiction,
+      effectiveFrom: { lte: asOf },
+      OR: [{ effectiveTo: null }, { effectiveTo: { gte: asOf } }],
+    },
+    orderBy: { effectiveFrom: 'desc' },
+  });
+  const dutyByHs = new Map<number, DutyRates>();
+  for (const r of rateRows) {
+    if (!dutyByHs.has(r.hsCodeId)) {
+      dutyByHs.set(r.hsCodeId, {
+        bcdRate: r.bcdRate,
+        swsRate: r.swsRate,
+        additionalDutyRate: r.additionalDutyRate,
+        igstRate: r.igstRate,
+      });
+    }
+  }
+
+  const charges: CalcChargeInput[] = [];
+  for (const c of shipment.charges) {
+    if (COMPUTED_COMPONENTS.has(c.component)) {
+      warnings.push(`Posted ${c.component} charge #${c.id} ignored — that component is computed by the duty engine.`);
+      continue;
+    }
+    charges.push({
+      component: c.component,
+      amount: c.amount,
+      currency: c.currencyCode,
+      basis: c.allocationBasis,
+      isEstimated: c.isEstimated,
+      description: c.description ?? undefined,
+    });
+  }
+  // Accrue demurrage per container unless an actual demurrage charge was already posted for it.
+  for (const c of containerView) {
+    const posted = shipment.charges.some((x) => x.component === 'DEMURRAGE' && x.containerId === c.id);
+    if (posted || !c.freeTimeStartAt || !c.demurrageRatePerDay) continue;
+    const days = accruedDemurrageDays(c.freeTimeStartAt, asOf, c.freeDays);
+    if (days > 0) {
+      charges.push({
+        component: 'DEMURRAGE',
+        amount: c.demurrageRatePerDay.times(days),
+        currency: 'INR',
+        basis: 'VALUE',
+        isEstimated: true,
+        description: `Container ${c.containerNo}: ${days} day(s) beyond ${c.freeDays} free`,
+      });
+    }
+  }
+
+  const currencies = [shipment.invoiceCurrencyCode, ...charges.map((c) => c.currency)];
+  const { lookup: fx, warnings: fxWarnings } = await buildFx(tx, currencies, asOf);
+  warnings.push(...fxWarnings);
+
+  const valuation = VALUATION_POLICY[jurisdiction] ?? DEFAULT_VALUATION;
+  const items: CalcItemInput[] = shipment.items.map((i) => ({
+    shipmentItemId: i.id,
+    hsCode: i.hsCode.code,
+    quantity: i.quantity,
+    unitPrice: i.unitPrice,
+    unitCostInr: i.unitCostInr,
+    netWeightKg: i.netWeightKg,
+    duty: dutyByHs.get(i.hsCodeId) ?? null,
+  }));
+
+  const calc = calculateLandedCost({
+    items,
+    charges,
+    invoiceCurrency: shipment.invoiceCurrencyCode,
+    fx,
+    policy: {
+      jurisdiction,
+      incoterm: shipment.incoterm,
+      igstRecoverable: opts.igstRecoverable,
+      landingChargePct: D(valuation.landingChargePct),
+      defaultInsurancePctOfFob: valuation.defaultInsurancePctOfFob ? D(valuation.defaultInsurancePctOfFob) : null,
+    },
+  });
+  warnings.push(...calc.warnings);
+
+  await tx.landedCostSheet.updateMany({
+    where: { shipmentId: shipment.id, status: { not: 'SUPERSEDED' } },
+    data: { status: 'SUPERSEDED' },
+  });
+  const last = await tx.landedCostSheet.aggregate({ where: { shipmentId: shipment.id }, _max: { versionNo: true } });
+  const sheet = await tx.landedCostSheet.create({
+    data: {
+      shipmentId: shipment.id,
+      versionNo: (last._max.versionNo ?? 0) + 1,
+      status: calc.hasEstimates ? 'PROVISIONAL' : 'FINAL',
+      totalInr: calc.totalInr,
+      recoverableTaxInr: calc.recoverableTaxInr,
+      hasEstimates: calc.hasEstimates,
+      notes: calc.warnings.join(' | ').slice(0, 500) || null,
+      computedById: actorId,
+    },
+  });
+  await tx.landedCostLine.createMany({
+    data: calc.lines.map((l) => ({
+      sheetId: sheet.id,
+      shipmentItemId: l.shipmentItemId,
+      component: l.component,
+      description: l.description,
+      originalAmount: l.originalAmount,
+      currencyCode: l.currency,
+      fxRate: l.fxRate,
+      amountInr: l.amountInr,
+      isRecoverable: l.isRecoverable,
+      isEstimated: l.isEstimated,
+    })),
+  });
+  await tx.landedCostItem.createMany({
+    data: calc.items.map((i) => ({
+      sheetId: sheet.id,
+      shipmentItemId: i.shipmentItemId,
+      quantity: i.quantity,
+      totalInr: i.totalInr,
+      landedUnitCostInr: i.landedUnitCostInr,
+    })),
+  });
+
+
+  return { sheet, calc };
 }

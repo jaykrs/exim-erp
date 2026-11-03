@@ -1,7 +1,7 @@
 import { Prisma } from '@prisma/client';
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
-import { getActorId } from '@/lib/auth';
+import { requireActor } from '@/lib/auth';
 import { DomainError } from '@/lib/errors';
 import { processPortArrival } from '@/modules/logistics/services/port-arrival.service';
 
@@ -40,7 +40,7 @@ const fail = (status: number, code: string, message: string, details?: unknown) 
  */
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   try {
-    const actorId = await getActorId(req);
+    const actorId = (await requireActor(req, 'logistics:write')).id;
 
     const { id } = await ctx.params;
     const shipmentId = Number(id);

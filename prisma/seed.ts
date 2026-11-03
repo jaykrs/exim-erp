@@ -6,6 +6,7 @@
  * rates are illustrative, NOT current CBIC notifications. Replace with real masters before use.
  */
 import { PrismaClient } from '@prisma/client';
+import { hashPassword } from '../src/lib/password';
 
 const prisma = new PrismaClient();
 const day = (iso: string) => new Date(`${iso}T00:00:00.000Z`);
@@ -27,16 +28,28 @@ async function main() {
       aeoValidTill: day('2028-03-31'),
     },
   });
-  const admin = await prisma.user.upsert({
-    where: { email: 'admin@demo-exim.test' },
-    update: {},
-    create: { companyId: company.id, email: 'admin@demo-exim.test', name: 'Demo Admin', role: 'ADMIN' },
-  });
-  await prisma.user.upsert({
-    where: { email: 'compliance@demo-exim.test' },
-    update: {},
-    create: { companyId: company.id, email: 'compliance@demo-exim.test', name: 'Demo Compliance', role: 'COMPLIANCE_OFFICER' },
-  });
+  // One demo user per role, all with SEED_PASSWORD (development only — change before any shared use).
+  const seedPassword = process.env.SEED_PASSWORD ?? 'ChangeMe-Dev-1';
+  const passwordHash = hashPassword(seedPassword);
+  const demoUsers = [
+    ['admin', 'Demo Admin', 'ADMIN'],
+    ['sourcing', 'Demo Sourcing', 'SOURCING_MANAGER'],
+    ['warehouse', 'Demo Warehouse', 'WAREHOUSE_MANAGER'],
+    ['logistics', 'Demo Logistics', 'LOGISTICS_MANAGER'],
+    ['compliance', 'Demo Compliance', 'COMPLIANCE_OFFICER'],
+    ['finance', 'Demo Finance', 'FINANCE_CONTROLLER'],
+    ['viewer', 'Demo Viewer', 'VIEWER'],
+  ] as const;
+  let admin = { id: 0 };
+  for (const [handle, name, role] of demoUsers) {
+    const email = `${handle}@demo-exim.test`;
+    const u = await prisma.user.upsert({
+      where: { email },
+      update: {},
+      create: { companyId: company.id, email, name, role, passwordHash },
+    });
+    if (role === 'ADMIN') admin = u;
+  }
 
   // ── Currencies & FX ────────────────────────────────────────────────────────
   for (const c of [
@@ -265,7 +278,7 @@ async function main() {
     },
   });
 
-  console.log(`Seeded. Try: POST /api/shipments/${exp.id}/port-arrival (export, x-user-id: ${admin.id}) and /${imp.id}/port-arrival (import).`);
+  console.log(`Seeded. Try: POST /api/shipments/${exp.id}/port-arrival (export, signed in as admin@demo-exim.test, id ${admin.id}) and /${imp.id}/port-arrival (import).`);
 }
 
 main()

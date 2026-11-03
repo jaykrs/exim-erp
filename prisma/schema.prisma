@@ -625,6 +625,7 @@ model User {
   companyId    Int?
   email        String   @unique @db.VarChar(190)
   name         String   @db.VarChar(120)
+  passwordHash String?  @db.VarChar(255) // scrypt$N$salt$hash; null = cannot log in
   role         UserRole @default(VIEWER)
   isActive     Boolean  @default(true)
   createdAt    DateTime @default(now())

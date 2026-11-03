@@ -53,11 +53,19 @@ test('ConsignmentStep has exactly the four nullable subject FKs the workflow map
 test('every UPPER_SNAKE literal the logistics/consignment code writes is a real enum value', { skip }, () => {
   const all = new Set(Object.values(enums).flat());
   // Literals that are intentionally not Prisma enum values (HTTP codes, error codes, policy keys, currencies, etc.).
-  const allow = new Set(['IN', 'INR', 'USD', 'MARKET', 'CUSTOMS', 'VALUE', 'WEIGHT', 'QUANTITY', 'P2034' /* Prisma tx conflict */, 'REEFER' /* prefix of REEFER_20/40 */, 'SHIPMENT' /* StepScope */]);
+  const allow = new Set(['IN', 'INR', 'USD', 'MARKET', 'CUSTOMS', 'VALUE', 'WEIGHT', 'QUANTITY', 'P2034' /* Prisma tx conflict */, 'REEFER' /* prefix of REEFER_20/40 */, 'SHIPMENT' /* StepScope */, 'SUBMIT', 'APPROVE' /* clearance action keys */, 'SB_FILING', 'BOE_FILING' /* IcegateMessage.messageType is free text */]);
   const files = [
     'src/modules/logistics/services/port-arrival.service.ts',
     'src/modules/consignment/step-tracker.ts',
     'src/modules/logistics/queries/batch-position.ts',
+    'src/modules/logistics/services/delivery.service.ts',
+    'src/modules/shared/shipment-ops.ts',
+    'src/modules/sourcing/services.ts',
+    'src/modules/warehouse/services.ts',
+    'src/modules/compliance/services.ts',
+    'src/modules/customs/services.ts',
+    'src/modules/finance/services.ts',
+    'src/lib/rbac.ts',
   ];
   const bad = [];
   for (const f of files) {

@@ -134,3 +134,46 @@ MySQL (testcontainers) before shipping.
 * Customs valuation add-ons (`landing 1%`, `default insurance 1.125%`) live in `VALUATION_POLICY` in the arrival service — confirm with your CHA / current CBIC notifications; non-India jurisdictions default to plain CIF (US values on FOB, so add a policy before shipping there).
 * `auth.ts` fails closed (401) outside development until wired to your session layer.
 * Next services, in checklist order: vendor verification · grading split (one Prisma transaction → `BatchGrade`) · token generation · shipping-bill/LEO · OOC release + **landed-cost finalisation** (writes `Product.unitLandedCostInr`) · POD sign-off + ownership transfer · settlement. Add a seed (currencies, HS codes + duty rates, `HsRegulatoryRule` rows) so the arrival endpoint can be exercised end to end.
+
+---
+
+## Full build: checklist → service → endpoint
+
+All 23 checklist steps now have a service, an RBAC-guarded endpoint and a dashboard view.
+
+| Steps | Domain | Service module | Endpoints (POST unless noted) |
+|---|---|---|---|
+| 1–4 | Sourcing | `src/modules/sourcing/services.ts` | `vendors/:id/verify`, `purchase-orders/:id/{execute-pi,forward-contract,trade-finance}` |
+| 5–7 | Warehouse | `src/modules/warehouse/services.ts` | `inward-receipts`, `batches/:id/{grade,trace-tags}` |
+| 8–10, 18 | Compliance | `src/modules/compliance/services.ts` | `batches/:id/{ispm15,lab-tests,label-validation}`, `shipments/:id/clearances/:board` |
+| 11–17, 19 | Customs | `src/modules/customs/services.ts` | `shipments/:id/{shipping-bill,incentives,leo,loading,departure,manifest,bill-of-entry,ooc}` |
+| 20, 23 | Finance | `src/modules/finance/services.ts` | `shipments/:id/{charges,recost,landed-cost/finalize,reconcile}` |
+| 21–22 | Logistics | `src/modules/logistics/services/delivery.service.ts` | `shipments/:id/{last-mile,delivery}` |
+| 15 (arrival) | Logistics | `port-arrival.service.ts` | `shipments/:id/port-arrival` |
+| read | — | `consignment/step-tracker.ts` | `GET shipments/:id/timeline`, `GET batch-positions/:batchNo` |
+
+Every action runs in one interactive transaction (`runTx`), records its checklist step, appends tracking events and an audit row, and is idempotent where the natural key allows (same SB no., LEO no., GRN, etc.).
+
+## Authentication and roles
+
+- `POST /api/auth/login` verifies a scrypt hash and sets an HttpOnly HMAC-signed cookie (`exim_session`, 8 h). `AUTH_SECRET` (≥ 32 chars) is required.
+- `src/middleware.ts` redirects page requests without a valid cookie to `/login`; **API routes authenticate themselves** via `requireActor(req, permission)` (401 / 403).
+- Permission matrix lives in `src/lib/rbac.ts` (`read`, `sourcing:write`, `trade-finance:write`, `warehouse:write`, `compliance:write`, `logistics:write`, `customs:write`, `finance:write`).
+- Dev-only `x-user-id`/`x-user-role` headers work only when `NODE_ENV=development`.
+- Seed creates 7 demo users (`admin@`, `sourcing@`, `warehouse@`, `logistics@`, `finance@`, `compliance@`, `viewer@demo-exim.test`) with the password in `SEED_PASSWORD`. **Change it outside development.**
+
+## Dashboards
+
+Read-only server components (`src/app/(dashboard)`): Overview, Shipments, Shipment detail (checklist timeline, tracking events, holds, clearances, landed cost), Sourcing, Warehouse, Compliance, Customs, Finance. Writes go through the API.
+
+## Verification status (this workspace)
+
+| Check | Result |
+|---|---|
+| `npm test` | 13 unit + 7 arrival scenarios + 23 regression tests pass |
+| Export lifecycle (18 steps, 16–20 skipped), import lifecycle | pass on the schema-aware in-memory DB |
+| Route 401/403/422/404, login, tampered/expired cookie, password hashing, RBAC | pass |
+| `npm run build` / full `tsc` | **not completed here**: `prisma generate` cannot download its engine (403). Without the generated client `tsc` reports implicit-`any` errors in every file that touches Prisma results; those are expected to clear after `npx prisma generate`. |
+| Real MySQL | **not run.** The in-memory DB models Prisma semantics (defaults, unique, FK, VARCHAR/DECIMAL limits, rollback) but not MySQL locking or SQL behaviour. |
+
+First steps on your machine: `npm i && npx prisma generate && npx prisma migrate dev && npx prisma db seed && npm run build && npm test`. Fix any type errors that appear once the client exists.
